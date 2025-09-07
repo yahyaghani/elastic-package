@@ -1,6 +1,12 @@
 # newer versions go on top
+- version: "0.1.1"
+  changes:
+    - description: Add httpjson stream template and data stream variables (url, api_key, team_id, etc.). Fix ingest pipeline (remove Groovy, add JSON processor) and related.* builder script.
+      type: enhancement
+      link: https://github.com/elastic/integrations/pull/  # TODO replace with real PR
+
 - version: "0.1.0"
   changes:
     - description: Initial draft of the package
       type: enhancement
-      link: https://github.com/elastic/integrations/pull/1 # FIXME Replace with the real PR link
+      link: https://github.com/elastic/integrations/pull/ # FIXME Replace with the real PR link
