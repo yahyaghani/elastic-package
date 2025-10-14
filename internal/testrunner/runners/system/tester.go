@@ -41,40 +41,75 @@ import (
 	"github.com/elastic/elastic-package/internal/wait"
 )
 
-const (
-	checkFieldsBody = `{
-		"fields": ["*"],
-		"runtime_mappings": {
-		  "my_ignored": {
-			"type": "keyword",
-			"script": {
-			  "source": "for (def v : params['_fields']._ignored.values) { emit(v); }"
-			}
-		  }
-		},
-		"aggs": {
-		  "all_ignored": {
-			"filter": {
-			  "exists": {
-				"field": "_ignored"
-			  }
-			},
-			"aggs": {
-			  "ignored_fields": {
-				"terms": {
-				  "size": 100,
-				  "field": "my_ignored"
-				}
-			  },
-			  "ignored_docs": {
-				"top_hits": {
-				  "size": 5
-				}
-			  }
-			}
-		  }
+const FieldsQuery = `{
+  "fields": [
+    "*"
+  ],
+  "runtime_mappings": {
+    "my_ignored": {
+      "type": "keyword",
+      "script": {
+        "source": "for (def v : params['_fields']._ignored.values) { emit(v); }"
+      }
+    }
+  },
+  "aggs": {
+    "all_ignored": {
+      "filter": {
+        "exists": {
+          "field": "_ignored"
+        }
+      },
+      "aggs": {
+        "ignored_fields": {
+          "terms": {
+            "size": 100,
+            "field": "my_ignored"
+          }
+        },
+        "ignored_docs": {
+          "top_hits": {
+            "size": 5
+          }
+        }
+      }
+    }
+  }
+}`
+
+type FieldsQueryResult struct {
+	Hits struct {
+		Total struct {
+			Value int
 		}
-	  }`
+		Hits []struct {
+			Source common.MapStr `json:"_source"`
+			Fields common.MapStr `json:"fields"`
+		}
+	}
+	Aggregations struct {
+		AllIgnored struct {
+			DocCount      int `json:"doc_count"`
+			IgnoredFields struct {
+				Buckets []struct {
+					Key string `json:"key"`
+				} `json:"buckets"`
+			} `json:"ignored_fields"`
+			IgnoredDocs struct {
+				Hits struct {
+					Hits []common.MapStr `json:"hits"`
+				} `json:"hits"`
+			} `json:"ignored_docs"`
+		} `json:"all_ignored"`
+	} `json:"aggregations"`
+	Error *struct {
+		Type   string
+		Reason string
+	}
+	Status int
+}
+
+const (
 	DevDeployDir = "_dev/deploy"
 
 	// TestType defining system tests
@@ -88,6 +123,9 @@ const (
 	ServiceLogsAgentDir = "/tmp/service_logs"
 
 	waitForDataDefaultTimeout = 10 * time.Minute
+
+	otelCollectorInputName = "otelcol"
+	otelSuffixDataset      = "otel"
 )
 
 type logsRegexp struct {
@@ -142,6 +180,7 @@ var (
 type fieldValidationMethod int
 
 const (
+	// Required to allow setting `fields` as an option via environment variable
 	fieldsMethod fieldValidationMethod = iota
 	mappingsMethod
 )
@@ -274,9 +313,14 @@ func NewSystemTester(options SystemTesterOptions) (*tester, error) {
 		return nil, fmt.Errorf("reading package manifest failed: %w", err)
 	}
 
-	r.dataStreamManifest, err = packages.ReadDataStreamManifest(filepath.Join(r.dataStreamPath, packages.DataStreamManifestFile))
-	if err != nil {
-		return nil, fmt.Errorf("reading data stream manifest failed: %w", err)
+	if r.dataStreamPath != "" {
+		// Avoid reading data stream manifest if path is empty (e.g. input packages) to avoid
+		// filling "r.dataStreamManifest" with values from package manifest since the resulting path will point to
+		// the package manifest instead of the data stream manifest.
+		r.dataStreamManifest, err = packages.ReadDataStreamManifest(filepath.Join(r.dataStreamPath, packages.DataStreamManifestFile))
+		if err != nil {
+			return nil, fmt.Errorf("reading data stream manifest failed: %w", err)
+		}
 	}
 
 	// If the environment variable is present, it always has preference over the root
@@ -460,7 +504,7 @@ func (r *tester) createAgentInfo(policy *kibana.Policy, config *testConfig, runI
 
 	// If user is defined in the configuration file, it has preference
 	// and it should not be overwritten by the value in the package or DataStream manifest
-	if info.Agent.User == "" && (r.pkgManifest.Agent.Privileges.Root || r.dataStreamManifest.Agent.Privileges.Root) {
+	if info.Agent.User == "" && r.agentRequiresRootPrivileges() {
 		info.Agent.User = "root"
 	}
 
@@ -477,6 +521,16 @@ func (r *tester) createAgentInfo(policy *kibana.Policy, config *testConfig, runI
 	}
 
 	return info, nil
+}
+
+func (r *tester) agentRequiresRootPrivileges() bool {
+	if r.pkgManifest.Agent.Privileges.Root {
+		return true
+	}
+	if r.dataStreamManifest != nil && r.dataStreamManifest.Agent.Privileges.Root {
+		return true
+	}
+	return false
 }
 
 func (r *tester) createServiceInfo() (servicedeployer.ServiceInfo, error) {
@@ -745,7 +799,7 @@ func (r *tester) getDocs(ctx context.Context, dataStream string) (*hits, error) 
 		r.esAPI.Search.WithSort("@timestamp:asc"),
 		r.esAPI.Search.WithSize(elasticsearchQuerySize),
 		r.esAPI.Search.WithSource("true"),
-		r.esAPI.Search.WithBody(strings.NewReader(checkFieldsBody)),
+		r.esAPI.Search.WithBody(strings.NewReader(FieldsQuery)),
 		r.esAPI.Search.WithIgnoreUnavailable(true),
 	)
 	if err != nil {
@@ -762,38 +816,7 @@ func (r *tester) getDocs(ctx context.Context, dataStream string) (*hits, error) 
 		return nil, fmt.Errorf("failed to search docs for data stream %s: %s", dataStream, resp.String())
 	}
 
-	var results struct {
-		Hits struct {
-			Total struct {
-				Value int
-			}
-			Hits []struct {
-				Source common.MapStr `json:"_source"`
-				Fields common.MapStr `json:"fields"`
-			}
-		}
-		Aggregations struct {
-			AllIgnored struct {
-				DocCount      int `json:"doc_count"`
-				IgnoredFields struct {
-					Buckets []struct {
-						Key string `json:"key"`
-					} `json:"buckets"`
-				} `json:"ignored_fields"`
-				IgnoredDocs struct {
-					Hits struct {
-						Hits []common.MapStr `json:"hits"`
-					} `json:"hits"`
-				} `json:"ignored_docs"`
-			} `json:"all_ignored"`
-		} `json:"aggregations"`
-		Error *struct {
-			Type   string
-			Reason string
-		}
-		Status int
-	}
-
+	var results FieldsQueryResult
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
 		return nil, fmt.Errorf("could not decode search results response: %w", err)
 	}
@@ -883,7 +906,7 @@ func (r *tester) getDeprecationWarnings(ctx context.Context, dataStream string) 
 	return result, nil
 }
 
-func (r *tester) checkDeprecationWarnings(stackVersion *semver.Version, dataStream string, warnings []deprecationWarning, configName string) []testrunner.TestResult {
+func (r *tester) checkDeprecationWarnings(stackVersion *semver.Version, warnings []deprecationWarning, configName string) []testrunner.TestResult {
 	var results []testrunner.TestResult
 	for _, warning := range warnings {
 		if ignoredDeprecationWarning(stackVersion, warning) {
@@ -940,9 +963,11 @@ func ignoredDeprecationWarning(stackVersion *semver.Version, warning deprecation
 }
 
 type scenarioTest struct {
+	// dataStream is the name of the target data stream where documents are indexed
 	dataStream          string
 	indexTemplateName   string
 	policyTemplateName  string
+	policyTemplateInput string
 	kibanaDataStream    kibana.PackageDataStream
 	syntheticEnabled    bool
 	docs                []common.MapStr
@@ -992,112 +1017,27 @@ func (r *tester) prepareScenario(ctx context.Context, config *testConfig, stackC
 	}
 
 	serviceOptions.DeployIndependentAgent = r.runIndependentElasticAgent
-
 	policyTemplateName := config.PolicyTemplate
 	if policyTemplateName == "" {
-		policyTemplateName, err = findPolicyTemplateForInput(*r.pkgManifest, *r.dataStreamManifest, config.Input)
+		policyTemplateName, err = FindPolicyTemplateForInput(r.pkgManifest, r.dataStreamManifest, config.Input)
 		if err != nil {
 			return nil, fmt.Errorf("failed to determine the associated policy_template: %w", err)
 		}
 	}
 	scenario.policyTemplateName = policyTemplateName
 
-	policyTemplate, err := selectPolicyTemplateByName(r.pkgManifest.PolicyTemplates, scenario.policyTemplateName)
+	policyTemplate, err := SelectPolicyTemplateByName(r.pkgManifest.PolicyTemplates, scenario.policyTemplateName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find the selected policy_template: %w", err)
 	}
+	scenario.policyTemplateInput = policyTemplate.Input
 
-	// Configure package (single data stream) via Fleet APIs.
-	testTime := time.Now().Format("20060102T15:04:05Z")
-	var policyToTest, policyCurrent, policyToEnroll *kibana.Policy
-	if r.runTearDown || r.runTestsOnly {
-		policyCurrent = &serviceStateData.CurrentPolicy
-		policyToEnroll = &serviceStateData.EnrollPolicy
-		logger.Debugf("Got current policy from file: %q - %q", policyCurrent.Name, policyCurrent.ID)
-	} else {
-		// Created a specific Agent Policy to enrolling purposes
-		// There are some issues when the stack is running for some time,
-		// agents cannot enroll with the default policy
-		// This enroll policy must be created even if independent Elastic Agents are not used. Agents created
-		// in Kubernetes or Custom Agents require this enroll policy too (service deployer).
-		logger.Debug("creating enroll policy...")
-		policyEnroll := kibana.Policy{
-			Name:        fmt.Sprintf("ep-test-system-enroll-%s-%s-%s-%s-%s", r.testFolder.Package, r.testFolder.DataStream, r.serviceVariant, r.configFileName, testTime),
-			Description: fmt.Sprintf("test policy created by elastic-package to enroll agent for data stream %s/%s", r.testFolder.Package, r.testFolder.DataStream),
-			Namespace:   common.CreateTestRunID(),
-		}
-
-		policyToEnroll, err = r.kibanaClient.CreatePolicy(ctx, policyEnroll)
-		if err != nil {
-			return nil, fmt.Errorf("could not create test policy: %w", err)
-		}
+	policyToEnrollOrCurrent, policyToTest, err := r.createOrGetKibanaPolicies(ctx, serviceStateData, stackConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kibana policies: %w", err)
 	}
 
-	r.deleteTestPolicyHandler = func(ctx context.Context) error {
-		// ensure that policyToEnroll policy gets deleted if the execution receives a signal
-		// before creating the test policy
-		// This handler is going to be redefined after creating the test policy
-		if r.runTestsOnly {
-			return nil
-		}
-		if err := r.kibanaClient.DeletePolicy(ctx, policyToEnroll.ID); err != nil {
-			return fmt.Errorf("error cleaning up test policy: %w", err)
-		}
-		return nil
-	}
-
-	if r.runTearDown {
-		// required to assign the policy stored in the service state file
-		// so data stream related to this Agent Policy can be obtained (and deleted)
-		// in the cleanTestScenarioHandler handler
-		policyToTest = policyCurrent
-	} else {
-		// Create a specific Agent Policy just for testing this test.
-		// This allows us to ensure that the Agent Policy used for testing is
-		// assigned to the agent with all the required changes (e.g. Package DataStream)
-		logger.Debug("creating test policy...")
-		policy := kibana.Policy{
-			Name:        fmt.Sprintf("ep-test-system-%s-%s-%s-%s-%s", r.testFolder.Package, r.testFolder.DataStream, r.serviceVariant, r.configFileName, testTime),
-			Description: fmt.Sprintf("test policy created by elastic-package test system for data stream %s/%s", r.testFolder.Package, r.testFolder.DataStream),
-			Namespace:   common.CreateTestRunID(),
-		}
-		// Assign the data_output_id to the agent policy to configure the output to logstash. The value is inferred from stack/_static/kibana.yml.tmpl
-		// TODO: Migrate from stack.logstash_enabled to the stack config.
-		if r.profile.Config("stack.logstash_enabled", "false") == "true" {
-			policy.DataOutputID = "fleet-logstash-output"
-		}
-		if stackConfig.OutputID != "" {
-			policy.DataOutputID = stackConfig.OutputID
-		}
-		policyToTest, err = r.kibanaClient.CreatePolicy(ctx, policy)
-		if err != nil {
-			return nil, fmt.Errorf("could not create test policy: %w", err)
-		}
-	}
-
-	r.deleteTestPolicyHandler = func(ctx context.Context) error {
-		logger.Debug("deleting test policies...")
-		if err := r.kibanaClient.DeletePolicy(ctx, policyToTest.ID); err != nil {
-			return fmt.Errorf("error cleaning up test policy: %w", err)
-		}
-		if r.runTestsOnly {
-			return nil
-		}
-		if err := r.kibanaClient.DeletePolicy(ctx, policyToEnroll.ID); err != nil {
-			return fmt.Errorf("error cleaning up test policy: %w", err)
-		}
-		return nil
-	}
-
-	// policyToEnroll is used in both independent agents and agents created by servicedeployer (custom or kubernetes agents)
-	policy := policyToEnroll
-	if r.runTearDown || r.runTestsOnly {
-		// required in order to be able select the right agent in `checkEnrolledAgents` when
-		// using independent agents or custom/kubernetes agents since policy data is set into `agentInfo` variable`
-		policy = policyCurrent
-	}
-
-	agentDeployed, agentInfo, err := r.setupAgent(ctx, config, serviceStateData, policy)
+	agentDeployed, agentInfo, err := r.setupAgent(ctx, config, serviceStateData, policyToEnrollOrCurrent)
 	if err != nil {
 		return nil, err
 	}
@@ -1116,7 +1056,7 @@ func (r *tester) prepareScenario(ctx context.Context, config *testConfig, stackC
 		}
 	}
 
-	service, svcInfo, err := r.setupService(ctx, config, serviceOptions, svcInfo, agentInfo, agentDeployed, policy, serviceStateData)
+	service, svcInfo, err := r.setupService(ctx, config, serviceOptions, svcInfo, agentInfo, agentDeployed, policyToEnrollOrCurrent, serviceStateData)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -1137,7 +1077,10 @@ func (r *tester) prepareScenario(ctx context.Context, config *testConfig, stackC
 	scenario.startTestTime = time.Now()
 
 	logger.Debug("adding package data stream to test policy...")
-	ds := createPackageDatastream(*policyToTest, *r.pkgManifest, policyTemplate, *r.dataStreamManifest, *config, policyToTest.Namespace)
+	ds, err := CreatePackageDatastream(policyToTest, r.pkgManifest, policyTemplate, r.dataStreamManifest, config.Input, config.Vars, config.DataStream.Vars, policyToTest.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("could not create package data stream: %w", err)
+	}
 	if r.runTearDown {
 		logger.Debug("Skip adding data stream config to policy")
 	} else {
@@ -1147,27 +1090,8 @@ func (r *tester) prepareScenario(ctx context.Context, config *testConfig, stackC
 	}
 	scenario.kibanaDataStream = ds
 
-	// Delete old data
-	logger.Debug("deleting old data in data stream...")
-
-	// Input packages can set `data_stream.dataset` by convention to customize the dataset.
-	dataStreamDataset := ds.Inputs[0].Streams[0].DataStream.Dataset
-	if r.pkgManifest.Type == "input" {
-		v, _ := config.Vars.GetValue("data_stream.dataset")
-		if dataset, ok := v.(string); ok && dataset != "" {
-			dataStreamDataset = dataset
-		}
-	}
-	scenario.indexTemplateName = fmt.Sprintf(
-		"%s-%s",
-		ds.Inputs[0].Streams[0].DataStream.Type,
-		dataStreamDataset,
-	)
-	scenario.dataStream = fmt.Sprintf(
-		"%s-%s",
-		scenario.indexTemplateName,
-		ds.Namespace,
-	)
+	scenario.indexTemplateName = BuildIndexTemplateName(ds, r.pkgManifest.Type, config.Vars)
+	scenario.dataStream = BuildDataStreamName(scenario.policyTemplateInput, ds, r.pkgManifest.Type, config.Vars)
 
 	r.cleanTestScenarioHandler = func(ctx context.Context) error {
 		logger.Debugf("Deleting data stream for testing %s", scenario.dataStream)
@@ -1318,7 +1242,7 @@ func (r *tester) prepareScenario(ctx context.Context, config *testConfig, stackC
 	if r.runSetup {
 		opts := scenarioStateOpts{
 			origPolicy:    &origPolicy,
-			enrollPolicy:  policyToEnroll,
+			enrollPolicy:  policyToEnrollOrCurrent,
 			currentPolicy: policyToTest,
 			config:        config,
 			agent:         *origAgent,
@@ -1332,6 +1256,149 @@ func (r *tester) prepareScenario(ctx context.Context, config *testConfig, stackC
 	}
 
 	return &scenario, nil
+}
+
+// BuildIndexTemplateName builds the expected index template name that is installed in Elasticsearch
+// when the package data stream is added to the policy.
+func BuildIndexTemplateName(ds kibana.PackageDataStream, manType string, cfgVars common.MapStr) string {
+	dataStreamDataset := getExpectedDatasetForTest(manType, ds.Inputs[0].Streams[0].DataStream.Dataset, cfgVars)
+
+	indexTemplateName := fmt.Sprintf(
+		"%s-%s",
+		ds.Inputs[0].Streams[0].DataStream.Type,
+		dataStreamDataset,
+	)
+	return indexTemplateName
+}
+
+// BuildDataStreamName builds the expected data stream name that is installed in Elasticsearch
+// when the package data stream is added to the policy.
+func BuildDataStreamName(policyTemplateInput string, ds kibana.PackageDataStream, manType string, cfgVars common.MapStr) string {
+	dataStreamDataset := getExpectedDatasetForTest(manType, ds.Inputs[0].Streams[0].DataStream.Dataset, cfgVars)
+
+	// Input packages using the otel collector input require to add a specific dataset suffix
+	if manType == "input" && policyTemplateInput == otelCollectorInputName {
+		dataStreamDataset = fmt.Sprintf("%s.%s", dataStreamDataset, otelSuffixDataset)
+	}
+
+	dataStreamName := fmt.Sprintf(
+		"%s-%s-%s",
+		ds.Inputs[0].Streams[0].DataStream.Type,
+		dataStreamDataset,
+		ds.Namespace,
+	)
+	return dataStreamName
+}
+
+func getExpectedDatasetForTest(pkgType, dataset string, cfgVars common.MapStr) string {
+	if pkgType == "input" {
+		// Input packages can set `data_stream.dataset` by convention to customize the dataset.
+		v, _ := cfgVars.GetValue("data_stream.dataset")
+		if ds, ok := v.(string); ok && ds != "" {
+			return ds
+		}
+	}
+	return dataset
+}
+
+// createOrGetKibanaPolicies creates the Kibana policies required for testing.
+// It creates two policies, one for enrolling the agent (policyToEnroll) and another one
+// for testing purposes (policyToTest) where the package data stream is added.
+// In case the tester is running with --teardown or --no-provision flags, then the policies
+// are read from the service state file created in the setup stage.
+func (r *tester) createOrGetKibanaPolicies(ctx context.Context, serviceStateData ServiceState, stackConfig stack.Config) (*kibana.Policy, *kibana.Policy, error) {
+	// Configure package (single data stream) via Fleet APIs.
+	testTime := time.Now().Format("20060102T15:04:05Z")
+	var policyToTest, policyCurrent, policyToEnroll *kibana.Policy
+	var err error
+
+	if r.runTearDown || r.runTestsOnly {
+		policyCurrent = &serviceStateData.CurrentPolicy
+		policyToEnroll = &serviceStateData.EnrollPolicy
+		logger.Debugf("Got current policy from file: %q - %q", policyCurrent.Name, policyCurrent.ID)
+	} else {
+		// Created a specific Agent Policy to enrolling purposes
+		// There are some issues when the stack is running for some time,
+		// agents cannot enroll with the default policy
+		// This enroll policy must be created even if independent Elastic Agents are not used. Agents created
+		// in Kubernetes or Custom Agents require this enroll policy too (service deployer).
+		logger.Debug("creating enroll policy...")
+		policyEnroll := kibana.Policy{
+			Name:        fmt.Sprintf("ep-test-system-enroll-%s-%s-%s-%s-%s", r.testFolder.Package, r.testFolder.DataStream, r.serviceVariant, r.configFileName, testTime),
+			Description: fmt.Sprintf("test policy created by elastic-package to enroll agent for data stream %s/%s", r.testFolder.Package, r.testFolder.DataStream),
+			Namespace:   common.CreateTestRunID(),
+		}
+
+		policyToEnroll, err = r.kibanaClient.CreatePolicy(ctx, policyEnroll)
+		if err != nil {
+			return nil, nil, fmt.Errorf("could not create test policy: %w", err)
+		}
+	}
+
+	r.deleteTestPolicyHandler = func(ctx context.Context) error {
+		// ensure that policyToEnroll policy gets deleted if the execution receives a signal
+		// before creating the test policy
+		// This handler is going to be redefined after creating the test policy
+		if r.runTestsOnly {
+			return nil
+		}
+		if err := r.kibanaClient.DeletePolicy(ctx, policyToEnroll.ID); err != nil {
+			return fmt.Errorf("error cleaning up test policy: %w", err)
+		}
+		return nil
+	}
+
+	if r.runTearDown {
+		// required to assign the policy stored in the service state file
+		// so data stream related to this Agent Policy can be obtained (and deleted)
+		// in the cleanTestScenarioHandler handler
+		policyToTest = policyCurrent
+	} else {
+		// Create a specific Agent Policy just for testing this test.
+		// This allows us to ensure that the Agent Policy used for testing is
+		// assigned to the agent with all the required changes (e.g. Package DataStream)
+		logger.Debug("creating test policy...")
+		policy := kibana.Policy{
+			Name:        fmt.Sprintf("ep-test-system-%s-%s-%s-%s-%s", r.testFolder.Package, r.testFolder.DataStream, r.serviceVariant, r.configFileName, testTime),
+			Description: fmt.Sprintf("test policy created by elastic-package test system for data stream %s/%s", r.testFolder.Package, r.testFolder.DataStream),
+			Namespace:   common.CreateTestRunID(),
+		}
+		// Assign the data_output_id to the agent policy to configure the output to logstash. The value is inferred from stack/_static/kibana.yml.tmpl
+		// TODO: Migrate from stack.logstash_enabled to the stack config.
+		if r.profile.Config("stack.logstash_enabled", "false") == "true" {
+			policy.DataOutputID = "fleet-logstash-output"
+		}
+		if stackConfig.OutputID != "" {
+			policy.DataOutputID = stackConfig.OutputID
+		}
+		policyToTest, err = r.kibanaClient.CreatePolicy(ctx, policy)
+		if err != nil {
+			return nil, nil, fmt.Errorf("could not create test policy: %w", err)
+		}
+	}
+
+	r.deleteTestPolicyHandler = func(ctx context.Context) error {
+		logger.Debug("deleting test policies...")
+		if err := r.kibanaClient.DeletePolicy(ctx, policyToTest.ID); err != nil {
+			return fmt.Errorf("error cleaning up test policy: %w", err)
+		}
+		if r.runTestsOnly {
+			return nil
+		}
+		if err := r.kibanaClient.DeletePolicy(ctx, policyToEnroll.ID); err != nil {
+			return fmt.Errorf("error cleaning up test policy: %w", err)
+		}
+		return nil
+	}
+
+	if r.runTearDown || r.runTestsOnly {
+		// required to return "policyCurrent" policy in order to be able select the right agent in `checkEnrolledAgents` when
+		// using independent agents or custom/kubernetes agents since policy data is set into `agentInfo` variable`
+		return policyCurrent, policyToTest, nil
+	}
+
+	// policyToEnroll is used in both independent agents and agents created by servicedeployer (custom or kubernetes agents)
+	return policyToEnroll, policyToTest, nil
 }
 
 func (r *tester) setupService(ctx context.Context, config *testConfig, serviceOptions servicedeployer.FactoryOptions, svcInfo servicedeployer.ServiceInfo, agentInfo agentdeployer.AgentInfo, agentDeployed agentdeployer.DeployedAgent, policy *kibana.Policy, state ServiceState) (servicedeployer.DeployedService, servicedeployer.ServiceInfo, error) {
@@ -1553,43 +1620,14 @@ func (r *tester) waitForDocs(ctx context.Context, config *testConfig, dataStream
 }
 
 func (r *tester) validateTestScenario(ctx context.Context, result *testrunner.ResultComposer, scenario *scenarioTest, config *testConfig) ([]testrunner.TestResult, error) {
-	// Validate fields in docs
-	// when reroute processors are used, expectedDatasets should be set depends on the processor config
-	var expectedDatasets []string
-	for _, pipeline := range r.pipelines {
-		var esIngestPipeline map[string]any
-		err := yaml.Unmarshal(pipeline.Content, &esIngestPipeline)
-		if err != nil {
-			return nil, fmt.Errorf("unmarshalling ingest pipeline content failed: %w", err)
-		}
-		processors, _ := esIngestPipeline["processors"].([]any)
-		for _, p := range processors {
-			processor, ok := p.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("unexpected processor %+v", p)
-			}
-			if reroute, ok := processor["reroute"]; ok {
-				if rerouteP, ok := reroute.(ingest.RerouteProcessor); ok {
-					expectedDatasets = append(expectedDatasets, rerouteP.Dataset...)
-				}
-			}
-		}
+	logger.Info("Validating test case...")
+	expectedDatasets, err := r.expectedDatasets(scenario, config)
+	if err != nil {
+		return nil, err
 	}
 
-	if expectedDatasets == nil {
-		var expectedDataset string
-		if ds := r.testFolder.DataStream; ds != "" {
-			expectedDataset = getDataStreamDataset(*r.pkgManifest, *r.dataStreamManifest)
-		} else {
-			expectedDataset = r.pkgManifest.Name + "." + scenario.policyTemplateName
-		}
-		expectedDatasets = []string{expectedDataset}
-	}
-	if r.pkgManifest.Type == "input" {
-		v, _ := config.Vars.GetValue("data_stream.dataset")
-		if dataset, ok := v.(string); ok && dataset != "" {
-			expectedDatasets = append(expectedDatasets, dataset)
-		}
+	if r.isTestUsingOTELCollectorInput(scenario.policyTemplateInput) {
+		logger.Warn("Validation for packages using OpenTelemetry Collector input is experimental")
 	}
 
 	fieldsValidator, err := fields.CreateValidatorForDirectory(r.dataStreamPath,
@@ -1599,6 +1637,8 @@ func (r *tester) validateTestScenario(ctx context.Context, result *testrunner.Re
 		fields.WithExpectedDatasets(expectedDatasets),
 		fields.WithEnabledImportAllECSSChema(true),
 		fields.WithDisableNormalization(scenario.syntheticEnabled),
+		// When using the OTEL collector input, just a subset of validations are performed (e.g. check expected datasets)
+		fields.WithOTELValidation(r.isTestUsingOTELCollectorInput(scenario.policyTemplateInput)),
 	)
 	if err != nil {
 		return result.WithErrorf("creating fields validator for data stream failed (path: %s): %w", r.dataStreamPath, err)
@@ -1611,7 +1651,7 @@ func (r *tester) validateTestScenario(ctx context.Context, result *testrunner.Re
 		})
 	}
 
-	if r.fieldValidationMethod == mappingsMethod {
+	if !r.isTestUsingOTELCollectorInput(scenario.policyTemplateInput) && r.fieldValidationMethod == mappingsMethod {
 		logger.Debug("Performing validation based on mappings")
 		exceptionFields := listExceptionFields(scenario.docs, fieldsValidator)
 
@@ -1668,7 +1708,7 @@ func (r *tester) validateTestScenario(ctx context.Context, result *testrunner.Re
 	}
 
 	// Check transforms if present
-	if err := r.checkTransforms(ctx, config, r.pkgManifest, scenario.kibanaDataStream, scenario.dataStream, scenario.syntheticEnabled); err != nil {
+	if err := r.checkTransforms(ctx, config, r.pkgManifest, scenario.dataStream, scenario.policyTemplateInput, scenario.syntheticEnabled); err != nil {
 		results, _ := result.WithError(err)
 		return results, nil
 	}
@@ -1683,7 +1723,7 @@ func (r *tester) validateTestScenario(ctx context.Context, result *testrunner.Re
 		}
 	}
 
-	if results := r.checkDeprecationWarnings(stackVersion, scenario.dataStream, scenario.deprecationWarnings, config.Name()); len(results) > 0 {
+	if results := r.checkDeprecationWarnings(stackVersion, scenario.deprecationWarnings, config.Name()); len(results) > 0 {
 		return results, nil
 	}
 
@@ -1696,6 +1736,56 @@ func (r *tester) validateTestScenario(ctx context.Context, result *testrunner.Re
 	}
 
 	return result.WithSuccess()
+}
+
+func (r *tester) expectedDatasets(scenario *scenarioTest, config *testConfig) ([]string, error) {
+	// when reroute processors are used, expectedDatasets should be set depends on the processor config
+	var expectedDatasets []string
+	for _, pipeline := range r.pipelines {
+		var esIngestPipeline map[string]any
+		err := yaml.Unmarshal(pipeline.Content, &esIngestPipeline)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshalling ingest pipeline content failed: %w", err)
+		}
+		processors, _ := esIngestPipeline["processors"].([]any)
+		for _, p := range processors {
+			processor, ok := p.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("unexpected processor %+v", p)
+			}
+			if reroute, ok := processor["reroute"]; ok {
+				if rerouteP, ok := reroute.(ingest.RerouteProcessor); ok {
+					expectedDatasets = append(expectedDatasets, rerouteP.Dataset...)
+				}
+			}
+		}
+	}
+
+	if expectedDatasets == nil {
+		// get dataset directly from package policy added when preparing the scenario
+		expectedDataset := scenario.kibanaDataStream.Inputs[0].Streams[0].DataStream.Dataset
+		if r.pkgManifest.Type == "input" {
+			if scenario.policyTemplateInput == otelCollectorInputName {
+				// Input packages whose input is `otelcol` must add the `.otel` suffix
+				// Example: httpcheck.metrics.otel
+				expectedDataset += "." + otelSuffixDataset
+			}
+		}
+		expectedDatasets = []string{expectedDataset}
+	}
+	if r.pkgManifest.Type == "input" {
+		v, _ := config.Vars.GetValue("data_stream.dataset")
+		if dataset, ok := v.(string); ok && dataset != "" {
+			if scenario.policyTemplateInput == otelCollectorInputName {
+				// Input packages whose input is `otelcol` must add the `.otel` suffix
+				// Example: httpcheck.metrics.otel
+				dataset += "." + otelSuffixDataset
+			}
+			expectedDatasets = append(expectedDatasets, dataset)
+		}
+	}
+
+	return expectedDatasets, nil
 }
 
 func (r *tester) runTest(ctx context.Context, config *testConfig, stackConfig stack.Config, svcInfo servicedeployer.ServiceInfo) ([]testrunner.TestResult, error) {
@@ -1735,6 +1825,19 @@ func (r *tester) runTest(ctx context.Context, config *testConfig, stackConfig st
 	}
 
 	return r.validateTestScenario(ctx, result, scenario, config)
+}
+
+func (r *tester) isTestUsingOTELCollectorInput(policyTemplateInput string) bool {
+	// Just supported for input packages currently
+	if r.pkgManifest.Type != "input" {
+		return false
+	}
+
+	if policyTemplateInput != otelCollectorInputName {
+		return false
+	}
+
+	return true
 }
 
 func dumpScenarioDocs(docs any) error {
@@ -1806,26 +1909,31 @@ func (r *tester) checkEnrolledAgents(ctx context.Context, agentInfo agentdeploye
 	return &agent, nil
 }
 
-func createPackageDatastream(
-	kibanaPolicy kibana.Policy,
-	pkg packages.PackageManifest,
+func CreatePackageDatastream(
+	kibanaPolicy *kibana.Policy,
+	pkg *packages.PackageManifest,
 	policyTemplate packages.PolicyTemplate,
-	ds packages.DataStreamManifest,
-	config testConfig,
+	ds *packages.DataStreamManifest,
+	cfgName string,
+	cfgVars, cfgDSVars common.MapStr,
 	suffix string,
-) kibana.PackageDataStream {
+) (kibana.PackageDataStream, error) {
 	if pkg.Type == "input" {
-		return createInputPackageDatastream(kibanaPolicy, pkg, policyTemplate, config, suffix)
+		return createInputPackageDatastream(kibanaPolicy, pkg, policyTemplate, cfgVars, cfgDSVars, suffix), nil
 	}
-	return createIntegrationPackageDatastream(kibanaPolicy, pkg, policyTemplate, ds, config, suffix)
+	if ds == nil {
+		return kibana.PackageDataStream{}, fmt.Errorf("data stream manifest is required for integration packages")
+	}
+	return createIntegrationPackageDatastream(kibanaPolicy, pkg, policyTemplate, ds, cfgName, cfgVars, cfgDSVars, suffix), nil
 }
 
 func createIntegrationPackageDatastream(
-	kibanaPolicy kibana.Policy,
-	pkg packages.PackageManifest,
+	kibanaPolicy *kibana.Policy,
+	pkg *packages.PackageManifest,
 	policyTemplate packages.PolicyTemplate,
-	ds packages.DataStreamManifest,
-	config testConfig,
+	ds *packages.DataStreamManifest,
+	cfgName string,
+	cfgVars, cfgDSVars common.MapStr,
 	suffix string,
 ) kibana.PackageDataStream {
 	r := kibana.PackageDataStream{
@@ -1844,42 +1952,46 @@ func createIntegrationPackageDatastream(
 	r.Package.Title = pkg.Title
 	r.Package.Version = pkg.Version
 
-	stream := ds.Streams[getDataStreamIndex(config.Input, ds)]
+	stream := ds.Streams[getDataStreamIndex(cfgName, ds)]
 	streamInput := stream.Input
 	r.Inputs[0].Type = streamInput
 
+	dataset := fmt.Sprintf("%s.%s", pkg.Name, ds.Name)
+	if len(ds.Dataset) > 0 {
+		dataset = ds.Dataset
+	}
 	streams := []kibana.Stream{
 		{
 			ID:      fmt.Sprintf("%s-%s.%s", streamInput, pkg.Name, ds.Name),
 			Enabled: true,
 			DataStream: kibana.DataStream{
 				Type:    ds.Type,
-				Dataset: getDataStreamDataset(pkg, ds),
+				Dataset: dataset,
 			},
 		},
 	}
 
 	// Add dataStream-level vars
-	streams[0].Vars = setKibanaVariables(stream.Vars, config.DataStream.Vars)
+	streams[0].Vars = setKibanaVariables(stream.Vars, cfgDSVars)
 	r.Inputs[0].Streams = streams
 
 	// Add input-level vars
 	input := policyTemplate.FindInputByType(streamInput)
 	if input != nil {
-		r.Inputs[0].Vars = setKibanaVariables(input.Vars, config.Vars)
+		r.Inputs[0].Vars = setKibanaVariables(input.Vars, cfgVars)
 	}
 
 	// Add package-level vars
-	r.Vars = setKibanaVariables(pkg.Vars, config.Vars)
+	r.Vars = setKibanaVariables(pkg.Vars, cfgVars)
 
 	return r
 }
 
 func createInputPackageDatastream(
-	kibanaPolicy kibana.Policy,
-	pkg packages.PackageManifest,
+	kibanaPolicy *kibana.Policy,
+	pkg *packages.PackageManifest,
 	policyTemplate packages.PolicyTemplate,
-	config testConfig,
+	cfgVars, cfgDSVars common.MapStr,
 	suffix string,
 ) kibana.PackageDataStream {
 	r := kibana.PackageDataStream{
@@ -1896,16 +2008,14 @@ func createInputPackageDatastream(
 			PolicyTemplate: policyTemplate.Name,
 			Enabled:        true,
 			Vars:           kibana.Vars{},
+			Type:           policyTemplate.Input,
 		},
 	}
-
-	streamInput := policyTemplate.Input
-	r.Inputs[0].Type = streamInput
 
 	dataset := fmt.Sprintf("%s.%s", pkg.Name, policyTemplate.Name)
 	streams := []kibana.Stream{
 		{
-			ID:      fmt.Sprintf("%s-%s.%s", streamInput, pkg.Name, policyTemplate.Name),
+			ID:      fmt.Sprintf("%s-%s.%s", policyTemplate.Input, pkg.Name, policyTemplate.Name),
 			Enabled: true,
 			DataStream: kibana.DataStream{
 				Type:    policyTemplate.Type,
@@ -1915,10 +2025,10 @@ func createInputPackageDatastream(
 	}
 
 	// Add policyTemplate-level vars.
-	vars := setKibanaVariables(policyTemplate.Vars, config.Vars)
+	vars := setKibanaVariables(policyTemplate.Vars, cfgVars)
 	if _, found := vars["data_stream.dataset"]; !found {
 		dataStreamDataset := dataset
-		v, _ := config.Vars.GetValue("data_stream.dataset")
+		v, _ := cfgVars.GetValue("data_stream.dataset")
 		if dataset, ok := v.(string); ok && dataset != "" {
 			dataStreamDataset = dataset
 		}
@@ -1957,7 +2067,7 @@ func setKibanaVariables(definitions []packages.Variable, values common.MapStr) k
 
 // getDataStreamIndex returns the index of the data stream whose input name
 // matches. Otherwise it returns the 0.
-func getDataStreamIndex(inputName string, ds packages.DataStreamManifest) int {
+func getDataStreamIndex(inputName string, ds *packages.DataStreamManifest) int {
 	for i, s := range ds.Streams {
 		if s.Input == inputName {
 			return i
@@ -1966,24 +2076,20 @@ func getDataStreamIndex(inputName string, ds packages.DataStreamManifest) int {
 	return 0
 }
 
-func getDataStreamDataset(pkg packages.PackageManifest, ds packages.DataStreamManifest) string {
-	if len(ds.Dataset) > 0 {
-		return ds.Dataset
-	}
-	return fmt.Sprintf("%s.%s", pkg.Name, ds.Name)
-}
-
-// findPolicyTemplateForInput returns the name of the policy_template that
+// FindPolicyTemplateForInput returns the name of the policy_template that
 // applies to the input under test. An error is returned if no policy template
 // matches or if multiple policy templates match and the response is ambiguous.
-func findPolicyTemplateForInput(pkg packages.PackageManifest, ds packages.DataStreamManifest, inputName string) (string, error) {
+func FindPolicyTemplateForInput(pkg *packages.PackageManifest, ds *packages.DataStreamManifest, inputName string) (string, error) {
 	if pkg.Type == "input" {
 		return findPolicyTemplateForInputPackage(pkg, inputName)
+	}
+	if ds == nil {
+		return "", errors.New("data stream must be specified for integration packages")
 	}
 	return findPolicyTemplateForDataStream(pkg, ds, inputName)
 }
 
-func findPolicyTemplateForDataStream(pkg packages.PackageManifest, ds packages.DataStreamManifest, inputName string) (string, error) {
+func findPolicyTemplateForDataStream(pkg *packages.PackageManifest, ds *packages.DataStreamManifest, inputName string) (string, error) {
 	if inputName == "" {
 		if len(ds.Streams) == 0 {
 			return "", errors.New("no streams declared in data stream manifest")
@@ -2021,7 +2127,7 @@ func findPolicyTemplateForDataStream(pkg packages.PackageManifest, ds packages.D
 	}
 }
 
-func findPolicyTemplateForInputPackage(pkg packages.PackageManifest, inputName string) (string, error) {
+func findPolicyTemplateForInputPackage(pkg *packages.PackageManifest, inputName string) (string, error) {
 	if inputName == "" {
 		if len(pkg.PolicyTemplates) == 0 {
 			return "", errors.New("no policy templates specified for input package")
@@ -2053,7 +2159,7 @@ func findPolicyTemplateForInputPackage(pkg packages.PackageManifest, inputName s
 	}
 }
 
-func selectPolicyTemplateByName(policies []packages.PolicyTemplate, name string) (packages.PolicyTemplate, error) {
+func SelectPolicyTemplateByName(policies []packages.PolicyTemplate, name string) (packages.PolicyTemplate, error) {
 	for _, policy := range policies {
 		if policy.Name == name {
 			return policy, nil
@@ -2062,7 +2168,7 @@ func selectPolicyTemplateByName(policies []packages.PolicyTemplate, name string)
 	return packages.PolicyTemplate{}, fmt.Errorf("policy template %q not found", name)
 }
 
-func (r *tester) checkTransforms(ctx context.Context, config *testConfig, pkgManifest *packages.PackageManifest, ds kibana.PackageDataStream, dataStream string, syntheticEnabled bool) error {
+func (r *tester) checkTransforms(ctx context.Context, config *testConfig, pkgManifest *packages.PackageManifest, dataStream, policyTemplateInput string, syntheticEnabled bool) error {
 	if config.SkipTransformValidation {
 		return nil
 	}
@@ -2116,6 +2222,8 @@ func (r *tester) checkTransforms(ctx context.Context, config *testConfig, pkgMan
 			fields.WithNumericKeywordFields(config.NumericKeywordFields),
 			fields.WithEnabledImportAllECSSChema(true),
 			fields.WithDisableNormalization(syntheticEnabled),
+			// When using the OTEL collector input, just a subset of validations are performed (e.g. check expected datasets)
+			fields.WithOTELValidation(r.isTestUsingOTELCollectorInput(policyTemplateInput)),
 		)
 		if err != nil {
 			return fmt.Errorf("creating fields validator for data stream failed (path: %s): %w", transformRootPath, err)
